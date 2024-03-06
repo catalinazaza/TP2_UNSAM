@@ -1,0 +1,567 @@
+---
+title: "TP2 - opción 1"
+author: "Catalina y Zaza María Belén Arvili"
+date: "16/08/2023"
+output:
+  word_document: default
+  pdf_document: default
+---
+
+```{r include=FALSE}
+library(readr)
+library(tidyverse)
+library (ggplot2)
+library(corrplot)
+library(tidymodels)
+library(GGally)
+library(gtsummary)
+library(gt)
+library(car) 
+library(viridis)
+library (ranger)
+library(inum)
+library("C50", character.only = TRUE)
+library (xgboost)
+```
+
+## Introducción
+
+A lo largo del presente trabajo buscaremos generar y comparar dos modelos para predecir la variable "ingresos de la ocupación principal" utilizando como fuente la Encuesta Permanente de Hogares (EPH) del INDEC. Para ello, realizaremos un análisis exploratorio de los datos que nos permitirá definir nuestras variables de interés. Luego, ajustaremos los distintos modelos para la predicción e imputación de ingresos, y finalmente evaluaremos y analizaremos los resultados obtenidos. 
+
+
+## Procesamiento inicial
+
+En el siguiente ejercicio, trabajaremos con un subconjunto de datos de la tabla de individuos de la EPH correspondiente al III trimestre del 2021. 
+
+Comenzamos eliminando de la base las variables que no nos interesan en tanto sirven para identificar las viviendas u hogares encuestados y el aglomerado en que se encuentran ubicados: "CODUSU", número de hogar ("NRO_HOGAR") y "AGLOMERADO". [^1]. 
+
+Luego, aplicamos filtros para: 
+-quedarnos únicamente con aquellos casos que registran ingresos mayores a 0
+-obtener las observaciones que regitran una cantidad de horas trabajadas mayores a 0 y menos a 999
+-eliminar los casos con faltantes de información.
+
+En tercer lugar, recodificamos la variable nivel educativo para disminuir la cantidad de categorías que engloba en su interior y facilitar el análisis de los datos. 
+
+|**Nivel educativo EPH**                             | **Nivel educativo final** | 
+|----------------------------------------------------|---------------------------|
+|Sin instrucción                                     | Bajo                      | 
+|Primaria incompleta                                 | Bajo                      | 
+|Primaria completa                                   | Bajo                      | 
+|Primaria incompleta (incluye educación especial)    | Bajo                      |
+|Secundaria incompleta                               | Bajo                      | 
+|Secundaria completa                                 | Medio                     | 
+|Superior universitaria incompleta                   | Medio                     | 
+|Superior universitaria completa                     | Alto                      | 
+
+
+[^1]: También las eliminamos dado que no debieran estar en la base recortada según la consigna del trabajo final. 
+
+
+```{r include=FALSE}
+base_raw <- read.csv('datos/M34_202103_eph.csv')
+
+#funciones exploratorias
+names(base_raw)
+head(base_raw)
+summary(base_raw)
+glimpse(base_raw) 
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+#limpieza de la base 
+base <- base_raw %>% 
+  select(-CODUSU, -NRO_HOGAR, -AGLOMERADO) %>% 
+  filter(P21>0) %>% 
+  filter(PP3E_TOT>=0 & PP3E_TOT <999) %>% 
+  filter(CALIFICACION != "falta informacion" & CALIFICACION != "Ns.Nc") 
+
+#recodificación de la base 
+base <- base %>% mutate(NIVEL_ED=case_when(NIVEL_ED=="Secundaria completa"| NIVEL_ED== "Superior universitaria incompleta" ~'Medio',
+                                           NIVEL_ED== "Sin instruccion"|NIVEL_ED=="Primaria incompleta"|NIVEL_ED=="Primaria completa"|NIVEL_ED=="Primaria incompleta (incluye educacion especial)"|NIVEL_ED=="Secundaria incompleta"~"Bajo",
+                                           NIVEL_ED=="Superior universitaria completa"~"Alto"))
+
+```
+
+## Eliminación de outliers
+
+En una segunda etapa de limpieza y preparación de la base de datos, quitamos los *outliers* o valores atípicos de la variable dependiente. Eliminamos 43 casos en los que encontramos valores de ingresos por encima de la media más 5 desvíos estándar, es decir, valores mayores a 283.781 pesos (los cuales representan menos del 0,03% de los casos presentes en la base).
+
+|:**Media ingresos **       :|: **Desvío estándar ingresos**:| 
+|:--------------------------:|:-----------------------------:|
+|:42.856                    :|: 48.185                      :| 
+
+
+
+```{r include=FALSE}
+#medidas resumen de la variable dependiente
+mean(base$P21)
+sd(base$P21)
+
+
+#peso del desvío estándar respecto a la media de la variable dependiente
+cv <- sd(base$P21) / mean(base$P21)
+
+ingreso_promediomas5desvios = mean(base$P21)+5*sd(base$P21)
+base <- base %>% filter(P21<ingreso_promediomas5desvios)
+
+summary(base$P21)
+
+```
+
+
+## Distribución de ingresos
+
+Al graficar la curva de la distribución de ingresos, observamos que es asimétrica positiva lo que indica mayor concentración de valores inferiores a la media: si bien algunos valores alcanzan los 280 mil pesos, el 75% de los datos registra valores inferiores a los 55.000 pesos.
+
+
+```{r echo=FALSE}
+
+base %>% 
+  ggplot (aes(x=P21))+
+  geom_density(alpha = 0.5, fill="#CA225E")+
+  scale_x_continuous(limits=c(0,280000), breaks = c (0, 70000, 140000, 210000, 280000))+
+  theme_minimal () +
+  theme(axis.title.y =  element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.x =  element_blank())+
+  labs(title = "Gráfico 1. Distribución de los ingresos de la ocupación principal",
+       subtitle = "Ingresos entre 0 y 280 mil pesos",
+       caption = "Fuente: Encuesta Permanente de Hogares (EPH), INDEC. Tercer trimestre 2021")
+```
+
+## Matriz de correlación
+
+Como primera aproximación a la selección de predictores generamos una matriz de correlación, la cual nos permite visualizar rápidamente las principales relaciones entre las variables.
+Identificamos que hay una cierta correlación entre ingresos (P21) y cantidad de horas trabajadas (PP3E_TOT); y entre ingresos y edad (CH06)
+
+```{r echo=FALSE}
+mi_paleta <- colorRampPalette(c("navy","#91CBD765", "#CA225E"))
+
+corr <- base %>%
+  select_if(is.numeric) %>%
+  cor()
+
+corr %>% 
+  corrplot(col = mi_paleta(200), tl.col = "black", method = "square")
+```
+
+## Relaciones entre variables
+
+Cuando visualizamos la relación entre ingresos, horas trabajadas y edad, vemos que a priori no hay una relación lineal entre las variables por lo que optamos por incorporar más de un predictor a nuestro modelo.
+
+
+```{r echo=FALSE}
+base%>% 
+  ggplot(aes(x=PP3E_TOT, y=P21/1000)) + 
+  geom_point(alpha=0.5, color="#91CBD765") + 
+  ylab("Ingresos individuales (en miles de pesos)") +
+  xlab("Horas trabajadas") +
+  labs(title = "Gráfico 2. Relación entre ingresos y cantidad de horas trabajadas por semana",
+       caption = "Fuente: Encuesta Permanente de Hogares (EPH), INDEC. Tercer trimestreo 2021")+
+  geom_smooth(method='lm', color = 'navy', se = FALSE) + 
+  theme_minimal()
+```
+
+```{r echo=FALSE}
+base %>% 
+  ggplot(aes(x=CH06, y=P21/1000)) + 
+  geom_point(alpha=0.5, color="#91CBD765") +
+  ylab("Ingresos individuales (en miles de pesos)") +
+  xlab("Edad") +
+  labs(title = "Gráfico 3. Relación entre ingresos y edad",
+       caption = "Fuente: Encuesta Permanente de Hogares (EPH), INDEC. Tercer trimestre 2021")+
+  geom_smooth(method='lm', color = 'navy', se = FALSE) + 
+  theme_minimal()
+```
+
+## Multicolinelidad
+
+Revisamos la multicolinealidad para evitar utilizar predictores correlacionados entre sí:
+
+```{r echo=FALSE}
+modelo_lineal<-lm(P21~.,data =base)
+vif(modelo_lineal)
+```
+
+Observamos que algunas variables como categoría ocupacional (CAT_OCUP), carácter de la ocupación principal (CATEGORIA) y calificación de la ocupación principal (CALIFICACION) tienen indices muy altos, lo que significa que los predictores se encuentran relaciones entre sí. Los quitamos de nuestra base de datos dado que no podemos no podemos aislar el efecto de cada uno de ellos sobre la variable independiente, por lo que nuestros coeficientes se vuelven más imprecisos.
+
+
+Recalculamos el VIF:
+
+```{r echo=FALSE}
+base_1 <- base %>% 
+  select(CH04, CH06, NIVEL_ED, PP3E_TOT, P21)
+
+modelo_lineal_2<-lm(P21~.,data =base_1)
+vif(modelo_lineal_2)
+```
+
+Ahora sí, vemos que nuestras variables explicativas no correlacionan.
+
+## Exploración de las variables relevantes
+Primero armarmos una matriz descriptiva de las variables elegidas anteriormente.
+
+```{r echo=FALSE}
+base_1 %>% 
+  ggpairs(ggplot2::aes(alpha = 0.8),labeller = label_wrap_gen(width=5))+
+  theme_minimal()+
+  theme(strip.text.x = element_text(size = 10),
+        strip.text.y = element_text(size = 10))
+```
+
+Continuamos graficando las relaciones entre la variable dependiente y las variables predictoras.
+
+En primer lugar observamos que hay una diferencia sustancial entre la cantidad de hombres y mujeres encuestado/as. A pesar de ello, podemos apreciar que los ingresos de las mujeres se concentran en mayor medida en valores más bajos en relación a los varones: en el primer caso, la media ronda los 36 mil pesos mientras que en el segundo se aproxima a los 46 mil pesos (un 27% más alto). 
+
+```{r echo=FALSE, warning=FALSE}
+base %>% 
+  ggplot(aes(P21/1000, fill=factor(CH04)))+
+  geom_histogram(stat="bin")+
+  xlab("Ingresos individuales (en miles de pesos)") +
+  ylab("Cantidad") +
+  labs(title = "Gráfico 4. Distribución de ingresos por genero",
+  caption = "Fuente: Encuesta Permanente de Hogares (EPH), INDEC. Tercer trimestreo 2021")+
+  guides(fill = guide_legend(title = "Sexo"))+
+  theme_minimal() 
+```
+
+```{r echo=FALSE, , warning=FALSE}
+ base %>% 
+  ggplot(aes(x=P21, y=CH04, color=CH04, fill=CH04))+
+ geom_boxplot(outlier.fill="red")+
+  scale_x_continuous(limits=c(0,250000), breaks = c (0, 50000, 100000, 150000))+
+  coord_flip()+
+  theme_minimal()+
+  theme(
+    plot.title = element_text(size = 15),
+    axis.title.x = element_text(size = 14),
+    axis.title.y = element_text(size = 14), 
+    axis.text = element_text(size = 14),
+    legend.position="none"
+  ) +
+  stat_summary(fun = mean, geom = "crossbar", shape = 5, size = 0.3, color = "white")+
+  ylab("Sexo") +
+  xlab("Ingresos") +
+  labs(title = "Gráfico 5. Ingresos de la ocupación principal según sexo",
+       caption = "Fuente: Encuesta Permanente de Hogares (EPH), INDEC. Tercer trimestreo 2021")
+
+ingresos_x_sexo <- base_1 %>% 
+  select(CH04, P21) %>% 
+group_by(CH04) %>% 
+  summarise(ingreso_promedio = mean(P21))
+
+```
+
+Lo mismo ocurre cuando observamos la relación entre el nivel educativo y el nivel de ingresos declarado: a medida que aumenta el primero, incrementa el segundo. 
+
+```{r echo=FALSE, warning=FALSE}
+
+base %>% 
+  ggplot(aes(x=P21, y=NIVEL_ED, color=NIVEL_ED, fill=NIVEL_ED))+
+  geom_boxplot(outlier.shape = NA)+
+  scale_x_continuous(limits=c(0,100500), breaks = c (0, 50000, 100000))+
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 15),
+    axis.title.x = element_text(size = 14),
+    axis.title.y = element_text(size = 14), 
+    axis.text = element_text(size = 14),
+    legend.position="none"
+  ) +
+  stat_summary(fun = mean, geom = "crossbar", shape = 1, size = 0.3, color = "white")+
+  ylab("Nivel educativo") +
+  xlab("Ingresos") +
+  labs(title = "Gráfico 6. Ingresos de la ocupación principal según nivel educativo",
+       caption = "Fuente: Encuesta Permanente de Hogares (EPH), INDEC. Tercer trimestre 2021")
+
+
+```
+
+## Modelo 1: Regresión lineal múltiple
+
+Habiendo hecho ya una exploración de la base, pasamos ahora sí a trabajar sobre una regresión lineal múltiple para predecir la variable "ingresos de la ocupación principal".
+
+Como explicamos anteriormente, para eliminar el efecto en la multicolinealidad utilizaremos las siguientes variables predictoras: sexo, edad, horas trabajadas y nivel educativo.
+
+```{r echo=FALSE}
+lm_spec <- linear_reg() %>%
+  set_engine("lm")
+
+lm_fit <- lm_spec %>%
+  fit(P21 ~ ., data = base_1)
+
+lm_fit %>% 
+  pluck("fit") %>%
+  summary()
+```
+Las 4 variables predictoras poseen coeficientes de regresión estadísticamente significativas. Según este modelo, ser de sexo masculino agrega 11.077 pesos al ingreso percibido con respecto a ser mujer *ceteris paribus* las demás variables. De manera análoga, cada año de edad suma 417 pesos y cada hora trabajada suma 484 pesos. Por el contrario, tener un nivel educativo medio en vez de alto resta 21.100 pesos mientras que poseer un nivel educativo bajo resta 33600 pesos. 
+
+De todas formas observamos que el R2 es de 0.2593 lo que significa que aproximadamente el 25,9% de la variabilidad de la variable dependiente es explicada por las variables predictoras incluidas en el modelo.
+
+Para más información sobre cómo funciona el modelo, visualizamos la distribución de los residuos (entendidos como la diferencia entre lo observado y lo predicho) y comparamos los valores reales con los predichos.
+
+```{r echo=FALSE}
+options(scipen=999)
+augment(lm_fit, new_data = base_1) %>%
+  dplyr::select(.resid, .pred)%>%
+  ggplot(aes(x=.pred, y=.resid)) +
+  geom_point(alpha=0.8, color="#91CBD765") +
+  theme_minimal () +
+  theme(axis.title.y =  element_blank(),
+    	axis.text.y = element_blank(),
+    	axis.title.x =  element_blank())+
+  labs(title = "Gráfico 7. Distribución de los residuos",
+   	subtitle = "Modelo 1: regresión lineal múltiple.")
+  geom_hline(yintercept=0, linetype='dashed')
+
+```
+
+
+```{r echo=FALSE}
+options(scipen=999)
+augment(lm_fit, new_data = base_1) %>% 
+  mutate(.resid = P21 - .pred) %>% 
+  dplyr::select(P21, .pred, .resid)%>%
+  ggplot(aes(y=.pred, x=P21, color=.resid)) + 
+  geom_point() + 
+  theme_minimal()  +
+  geom_abline(intercept = 0, slope = 1, size = 1, color="grey")+
+  scale_color_viridis(option = "C")+
+  labs(title = "Gráfico 8. Comparación de los valores reales con las predicciones",
+   	subtitle = "Modelo 1: regresión lineal múltiple")+
+  geom_abline(intercept = 0, slope = 1, size = 1, color="grey")+
+  guides(color = guide_legend(title = "Residuos", title.position = "top"))+
+  ylab("Valores predichos") +
+  xlab("Valores reales")
+```
+
+En cuanto a las predicciones acertadas, encontramos que nuestro modelo predice mejor de 0 a 100.000 pesos de ingresos, mientras que a medida que la variable P21 (ingresos de la ocupación principal) aumenta, el grado residual de nuestro grafico también lo hace. Esto quiero decir que es un modelo sesgado (particularmente en los valores más altos de la variable dependiente) por lo que termina por subestimar o sobreestimar el valor a predecir en. 
+
+ 
+
+## Modelo 2: Árbol de decisión
+
+Luego de realizar una regresión lineal múltiple, probamos predecir los ingresos a través de un modelo más complejo, en este caso elegimos un árbol de decisión simple. A diferencia de la regresión lineal múltiple, no es necesario eliminar las variables que presentan multicolinealidad por lo que trabajaremos con todas las variables incluidas en la base. 
+
+```{r include=FALSE}
+set.seed(123)
+
+#partición train-test
+split <- initial_split(base, strata = P21)
+train <- training(split)
+test <- testing(split)
+
+#receta: preprocesamiento de las variables que entran al modelo
+recipe <- recipe(P21 ~ ., data = train)%>%
+  step_dummy(all_nominal(), one_hot = TRUE) %>% 
+  step_normalize(all_numeric_predictors())
+
+#se agrega receta al workflow
+wf <- workflow() %>% add_recipe(recipe)
+
+#se declara el tipo de modelo, el motor, el modo (clasificación) y sus parámetros (trees, min_n)
+tree_spec <- decision_tree(
+  cost_complexity = tune(),
+  tree_depth = tune(),
+  min_n = tune()
+)  %>%
+  set_engine("rpart") %>%
+  set_mode("regression")
+
+wf <- wf %>% add_model(tree_spec)
+
+#creamos la grilla de hiperparámetros para cross-validation
+set.seed(1912)
+tree_grid <- grid_regular(cost_complexity(), tree_depth(), min_n(), levels = 4)
+
+#elegimos la cantidad de muestras (folds)
+set.seed(111)
+folds <- vfold_cv(train, v = 10)
+
+tidy(folds)
+doParallel::registerDoParallel()
+
+set.seed(345)
+
+# corremos el modelo
+tree_rs <- wf %>% 
+  tune_grid(
+    resamples = folds,
+    grid = tree_grid,
+    metrics = metric_set(rmse, rsq)
+  )
+```
+
+
+
+
+```{r include=FALSE}
+
+#Se selecciona el mejor modelo en base a las métricas de evaluación elegidas
+show_best(tree_rs, "rmse")
+best_model <- select_best(tree_rs, "rmse")
+
+final_tree <- finalize_model(tree_spec, best_model)
+
+final_fit <- wf %>% update_model(final_tree) %>% fit(train)
+
+final_fit
+```
+
+Evaluamos el funcionamiento del modelo, teniendo la referencia de nuestra base original
+
+```{r echo=FALSE}
+summary(base$P21)
+```
+
+
+```{r include=FALSE}
+options(scipen=999)
+
+test_valid <- final_fit %>% 
+  predict(test) %>% 
+  bind_cols(test, .)
+
+test_valid %>% select(P21, .pred)
+```
+
+
+```{r echo=FALSE}
+metrics <- metric_set(rmse, rsq)
+
+metrics(test_valid, truth = P21, .pred)
+
+```
+Dado que la media de ingresos de la base original era de 41.721 pesos, según las métricas de evaluación del modelo vemos que el *error cuadratico medio (rmse)* que mide nuestra prediccion respecto al valor real, está en 25.255, por lo cual las predicciones se desvían en promedio un 60% de la media de la variable ingresos. Por esto entendemos que el modelo no performa bien dado que el error es alto en proporción al ingreso medio.
+
+Luego, respecto al *Rcuadrado (rsq)* que nos indica que tan bien nuestro modelo fittea, la métrica devuelve un valor de 0.39, lo cual significa que 39% de la variablilidad de los datos se puede explicar mediante el modelo.
+
+
+## Modelo 3: Ada Boosting
+
+Nuestro modelo de arbol de decision simple no performa con buenos resultados, por lo que probaremos con un modelo de boosting, donde entrenaremos varios árboles secuencialmente y en el cual cada árbol corregirá su error en base al resultado de su par anterior.
+
+Elegimos los hiperparámetros "cantidad de árboles" y "min_n" para ser tuneados, con una grilla de 10 combinaciones.
+
+```{r eval=FALSE, include=FALSE}
+xgb_spec <- boost_tree(
+  trees = 100,
+  tree_depth = tune(), 
+  min_n = tune(),
+  loss_reduction = tune(),                    
+  sample_size = tune(), 
+  mtry = tune(),         
+  learn_rate = tune()                       
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+
+wf <- wf %>% 
+  update_model(xgb_spec) %>% 
+  step_dummy()
+
+xgb_grid <- grid_latin_hypercube(
+  tree_depth(),
+  min_n(),
+  loss_reduction(),
+  sample_size = sample_prop(),
+  finalize(mtry(), train),
+  learn_rate(),
+  size = 10
+)
+
+
+#muestras para hacer cross validation
+set.seed(912)
+folds <- vfold_cv(train, strata = P21)
+
+#tuneo de hiperparametros
+set.seed(234)
+xgb_res <- tune_grid(
+  wf,
+  resamples = folds,
+  grid = xgb_grid,
+  control = control_grid(save_pred = TRUE)
+)
+```
+
+
+Extraemos las métricas de performance
+```{r eval=FALSE, include=FALSE}
+xgb_res %>% 
+  collect_metrics()
+
+xgb_res %>% 
+  show_best('rmse')
+```
+
+Graficamos los resultados
+
+```{r eval=FALSE, include=FALSE}
+#xgb_res %>% 
+#collect_metrics() %>% 
+ # mutate(tree_depth = factor(tree_depth)) %>% 
+  #ggplot(mapping = aes(x = learn_rate, y = mean,
+                       color = tree_depth)) +
+  #geom_line(size = 0.6) +
+  #geom_point(size = 2) +
+  #facet_wrap(~ .metric, scales = 'free', nrow = 2)+
+  #scale_color_viridis_d(option = "plasma", begin = .9, end = 0)
+
+best_tree <- xgb_res %>% 
+  select_best('rmse')
+
+best_tree
+```
+
+No sabemos por que es el mejor modelo *** pero observamos el learn_rate mas elevado y el loss_reduction mas bajo de todos
+Con una profundidad tree_depth de 4, considerablemente mas baja que el segundo modelo , de 9
+
+Actualizamos el workflow para tomar el mejor árbol
+```{r eval=FALSE, include=FALSE}
+
+final_tree_2 <- finalize_model(xgb_spec, best_tree)
+final_fit_2 <- wf %>% update_model(final_tree_2) %>% fit(train)
+
+
+
+```
+
+
+Evaluamos el funcionamiento del modelo
+
+```{r eval=FALSE, include=FALSE}
+test_valid_2 <- final_fit_2 %>% predict(test) %>% bind_cols(test, .)
+
+test_valid %>% select(P21, .pred)
+
+metrics <- metric_set(rmse, rsq)
+
+metrics(test_valid, truth = P21, .pred)
+```
+
+Comparar resultados de los modelos
+
+```{r eval=FALSE, include=FALSE}
+#falta resolver este gráfico
+boost_valid <- fit_tree %>%
+  predict(test) %>%
+  bind_cols(., test)
+
+boost_valid <- predict(fit_tree, test, type = "prob") %>%
+  bind_cols(boost_valid, .)
+
+
+class_metrics <- metric_set(rmse, mae)
+
+boost_metrics <- rmse(boost_valid, truth = P21, estimate = ".pred") %>%
+  mutate(model = "Boosting")
+
+metrics_eval <- bind_rows(metrics_eval, boost_metrics)
+
+ggplot(metrics_eval, aes(x = .metric, y = .estimate, fill = model))+
+  geom_col(position = "dodge")+
+  scale_fill_viridis_d()+
+  theme_minimal()
+
